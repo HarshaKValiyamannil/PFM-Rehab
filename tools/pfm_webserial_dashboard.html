@@ -1,0 +1,314 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>PFM Rehab Monitor</title>
+  <style>
+    :root {
+      font-family: Segoe UI, system-ui, sans-serif;
+      --green: #2e7d32;
+      --red: #c62828;
+      --blue: #1565c0;
+      --ink: #1f2933;
+      --muted: #6b7280;
+      --line: #d7dde5;
+      --bg: #f5f7fa;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--bg); color: var(--ink); }
+    header {
+      padding: 16px 20px;
+      background: white;
+      border-bottom: 1px solid var(--line);
+      display: flex;
+      gap: 12px;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+    h1 { font-size: 18px; margin: 0 16px 0 0; }
+    button {
+      height: 38px;
+      border: 1px solid #111827;
+      border-radius: 6px;
+      background: #111827;
+      color: white;
+      padding: 0 14px;
+      font: inherit;
+      cursor: pointer;
+    }
+    button.secondary { background: white; color: #111827; }
+    main {
+      max-width: 1100px;
+      margin: 0 auto;
+      padding: 18px;
+      display: grid;
+      gap: 16px;
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: minmax(260px, 1fr) minmax(280px, 1fr);
+      gap: 16px;
+    }
+    .panel {
+      background: white;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 16px;
+    }
+    .prediction {
+      min-height: 190px;
+      display: grid;
+      place-items: center;
+      text-align: center;
+      background: #616161;
+      color: white;
+    }
+    .prediction strong {
+      display: block;
+      font-size: clamp(42px, 9vw, 82px);
+      line-height: 1;
+    }
+    .prediction span {
+      display: block;
+      margin-top: 10px;
+      font-size: 18px;
+    }
+    .bars { display: grid; gap: 14px; }
+    .bar-row {
+      display: grid;
+      grid-template-columns: 72px 1fr 58px;
+      gap: 10px;
+      align-items: center;
+    }
+    .track {
+      height: 18px;
+      background: #edf1f5;
+      border-radius: 4px;
+      overflow: hidden;
+      border: 1px solid #dbe2ea;
+    }
+    .fill {
+      height: 100%;
+      width: 0%;
+      background: #4b5563;
+      transition: width 120ms ease-out;
+    }
+    .fill.Correct { background: var(--green); }
+    .fill.Push { background: var(--red); }
+    .fill.Rest { background: var(--blue); }
+    .facts { display: grid; gap: 8px; color: var(--muted); font-size: 15px; }
+    .facts b { color: var(--ink); }
+    .samples, .log {
+      height: 240px;
+      overflow: auto;
+      background: #0f172a;
+      color: #dbeafe;
+      border-radius: 6px;
+      padding: 12px;
+      font-family: Consolas, monospace;
+      font-size: 13px;
+      white-space: pre-wrap;
+    }
+    .samples { background: #172033; color: #e5e7eb; }
+    .hint { color: var(--muted); font-size: 14px; }
+    @media (max-width: 760px) {
+      .grid { grid-template-columns: 1fr; }
+      header { align-items: stretch; }
+      button { width: 100%; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>PFM Rehab Monitor</h1>
+    <button id="connect">Connect Arduino</button>
+    <button id="disconnect" class="secondary">Disconnect</button>
+    <span id="status">Not connected</span>
+  </header>
+  <main>
+    <div class="hint">
+      Use Chrome or Edge. Close PlatformIO Serial Monitor first, then click Connect Arduino and choose the Arduino COM port.
+    </div>
+    <section class="grid">
+      <div id="prediction" class="panel prediction">
+        <div>
+          <strong id="top">Waiting</strong>
+          <span id="confidence">No prediction yet</span>
+        </div>
+      </div>
+      <div class="panel">
+        <div class="bars" id="bars"></div>
+      </div>
+    </section>
+    <section class="grid">
+      <div class="panel facts">
+        <div><b>Anomaly:</b> <span id="anomaly">--</span></div>
+        <div><b>LEDs:</b> <span id="leds">--</span></div>
+        <div><b>Window:</b> <span id="window">--</span></div>
+        <div><b>Last Update:</b> <span id="age">never</span></div>
+      </div>
+      <div class="panel">
+        <b>Latest Samples</b>
+        <div class="samples" id="samples"></div>
+      </div>
+    </section>
+    <section class="panel">
+      <b>Serial Log</b>
+      <div class="log" id="log"></div>
+    </section>
+  </main>
+
+  <script>
+    const labels = ["Correct", "Push", "Rest"];
+    const colors = { Correct: "#2e7d32", Push: "#c62828", Rest: "#1565c0", Unknown: "#616161" };
+    const predictionRe = /^\s+(Correct|Push|Rest):\s+([0-9.]+)/;
+    const topRe = /^Top:\s+(\w+)\s+\(([0-9.]+)\)/;
+    const anomalyRe = /^Anomaly score:\s+([0-9.]+)/;
+    const ledsRe = /^LEDs - Green:(ON|OFF) Red:(ON|OFF) Blue:(ON|OFF)/;
+    const sampleRe = /^Sample\s+\d+:\s+(.+)/;
+    const windowRe = /^Window end:\s+(\d+)\s+ms/;
+
+    let port = null;
+    let reader = null;
+    let keepReading = false;
+    let lastUpdate = null;
+    let buffer = "";
+
+    const bars = document.getElementById("bars");
+    labels.forEach(label => {
+      const row = document.createElement("div");
+      row.className = "bar-row";
+      row.innerHTML = `<div>${label}</div><div class="track"><div id="fill-${label}" class="fill ${label}"></div></div><div id="value-${label}">0.000</div>`;
+      bars.appendChild(row);
+    });
+
+    function setStatus(message) {
+      document.getElementById("status").textContent = message;
+    }
+
+    async function connect() {
+      if (!("serial" in navigator)) {
+        setStatus("Web Serial is not available. Use Chrome or Edge.");
+        return;
+      }
+
+      try {
+        port = await navigator.serial.requestPort();
+        await port.open({ baudRate: 115200 });
+        setStatus("Connected");
+        keepReading = true;
+        readLoop();
+      } catch (error) {
+        setStatus(`Connection failed: ${error.message}`);
+      }
+    }
+
+    async function disconnect() {
+      keepReading = false;
+      if (reader) {
+        try { await reader.cancel(); } catch (_) {}
+      }
+      if (port) {
+        try { await port.close(); } catch (_) {}
+      }
+      port = null;
+      setStatus("Disconnected");
+    }
+
+    async function readLoop() {
+      const decoder = new TextDecoder();
+      while (port && keepReading) {
+        try {
+          reader = port.readable.getReader();
+          while (keepReading) {
+            const { value, done } = await reader.read();
+            if (done) break;
+            buffer += decoder.decode(value, { stream: true });
+            const lines = buffer.split(/\r?\n/);
+            buffer = lines.pop();
+            lines.forEach(line => handleLine(line.trim()));
+          }
+        } catch (error) {
+          setStatus(`Read error: ${error.message}`);
+        } finally {
+          if (reader) {
+            reader.releaseLock();
+            reader = null;
+          }
+        }
+      }
+    }
+
+    function handleLine(line) {
+      if (!line) return;
+      appendLog(line);
+
+      let match = predictionRe.exec(line);
+      if (match) {
+        const value = Number(match[2]);
+        document.getElementById(`fill-${match[1]}`).style.width = `${Math.round(value * 100)}%`;
+        document.getElementById(`value-${match[1]}`).textContent = value.toFixed(3);
+        return;
+      }
+
+      match = topRe.exec(line);
+      if (match) {
+        const label = match[1];
+        const value = Number(match[2]);
+        lastUpdate = Date.now();
+        document.getElementById("top").textContent = label;
+        document.getElementById("confidence").textContent = `Confidence ${value.toFixed(3)}`;
+        document.getElementById("prediction").style.background = colors[label] || colors.Unknown;
+        return;
+      }
+
+      match = anomalyRe.exec(line);
+      if (match) {
+        document.getElementById("anomaly").textContent = Number(match[1]).toFixed(3);
+        return;
+      }
+
+      match = ledsRe.exec(line);
+      if (match) {
+        document.getElementById("leds").textContent = `Green ${match[1]} | Red ${match[2]} | Blue ${match[3]}`;
+        return;
+      }
+
+      match = sampleRe.exec(line);
+      if (match) {
+        prependSample(match[1]);
+        return;
+      }
+
+      match = windowRe.exec(line);
+      if (match) {
+        document.getElementById("window").textContent = `${match[1]} ms`;
+      }
+    }
+
+    function appendLog(line) {
+      const log = document.getElementById("log");
+      log.textContent += line + "\n";
+      const lines = log.textContent.split("\n");
+      if (lines.length > 260) log.textContent = lines.slice(-220).join("\n");
+      log.scrollTop = log.scrollHeight;
+    }
+
+    function prependSample(value) {
+      const samples = document.getElementById("samples");
+      const lines = samples.textContent ? samples.textContent.split("\n") : [];
+      lines.unshift(value);
+      samples.textContent = lines.slice(0, 12).join("\n");
+    }
+
+    setInterval(() => {
+      const age = document.getElementById("age");
+      age.textContent = lastUpdate ? `${((Date.now() - lastUpdate) / 1000).toFixed(1)}s ago` : "never";
+    }, 250);
+
+    document.getElementById("connect").addEventListener("click", connect);
+    document.getElementById("disconnect").addEventListener("click", disconnect);
+  </script>
+</body>
+</html>
